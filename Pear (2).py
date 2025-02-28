@@ -2,16 +2,61 @@ import os
 import torch
 import timm
 import time
+import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 from torch import nn, optim
+from torchvision.models.segmentation import deeplabv3_resnet50
+import numpy as np
 from torchvision import transforms
 from PIL import Image
 
 # Thiết lập thiết bị
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+# Load mô hình DeepLabV3 đã pretrain trên COCO
+segmentation_model = deeplabv3_resnet50(pretrained=True).eval().to(device) # Thêm
+
 disease_classes = ['curl', 'healthy', 'leaf_spot', 'pear_slug', 'test1', 'test2']
 severity_classes = ['0', '1', '2', '3', '4', 'test']
+
+def preprocess_for_segmentation(image): # Thêm
+    transform = transforms.Compose([
+        transforms.Resize((256, 256)),  # Resize ảnh về 256x256 để phù hợp với mô hình
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Chuẩn hóa theo COCO
+    ])
+    return transform(image).unsqueeze(0).to(device)  # Thêm batch dimension
+
+
+def segment_leaf(image_path): 
+    image = Image.open(image_path).convert("RGB")  
+    input_tensor = preprocess_for_segmentation(image)  
+
+    with torch.no_grad():
+        output = segmentation_model(input_tensor)
+        if isinstance(output, dict) and 'out' in output:
+            output = output['out'][0]
+        else:
+            print("⚠️ DeepLabV3 không trả về key 'out', kiểm tra lại mô hình!")
+            return image  
+
+    mask = output.argmax(0).byte().cpu().numpy()  
+    print("Unique values in mask:", np.unique(mask))  
+
+    leaf_class = 21 if 21 in np.unique(mask) else mask.max()  
+    mask = (mask == leaf_class).astype(np.uint8)  
+
+    # Resize mask về kích thước gốc của ảnh
+    mask_resized = Image.fromarray(mask * 255).resize(image.size, Image.NEAREST)
+    mask_resized = np.array(mask_resized) // 255  
+
+    # Áp dụng mask lên ảnh gốc
+    image_array = np.array(image)
+    segmented_image = image_array * mask_resized[:, :, None]  
+
+    return Image.fromarray(segmented_image)
+
 
 # Dataset tùy chỉnh
 class CustomDataset(Dataset):
@@ -91,7 +136,7 @@ class SeverityModel(nn.Module):
         return self.base_model(x)
 
 # Huấn luyện mô hình bệnh
-def train_disease_model(model, dataloader, criterion, optimizer, epochs=5):
+def train_disease_model(model, dataloader, criterion, optimizer, epochs=1):
     print("Starting disease model training...")
     model.train()
     
@@ -124,12 +169,12 @@ def train_disease_model(model, dataloader, criterion, optimizer, epochs=5):
             total_samples += disease_labels.size(0)
 
             # In thông tin batch
-            #print(f"Loss: {loss.item():.4f}, Accuracy: {correct_disease/total_samples*100:.2f}%")
+            print(f"Batch {batch_idx + 1} - Loss: {loss.item():.4f}, Accuracy: {correct_disease/total_samples*100:.2f}%")
 
         print(f"Epoch {epoch+1}, Loss: {running_loss/len(dataloader):.4f}, Disease Acc: {correct_disease/total_samples*100:.2f}%\n")
 
 # Huấn luyện mô hình mức độ nghiêm trọng
-def train_severity_model(model, dataloader, criterion, optimizer, epochs=5):
+def train_severity_model(model, dataloader, criterion, optimizer, epochs=1):
     print("Starting severity model training...")
     model.train()
     
@@ -161,7 +206,7 @@ def train_severity_model(model, dataloader, criterion, optimizer, epochs=5):
             correct_severity += (preds == severity_labels).sum().item()
             total_samples += severity_labels.size(0)
 
-            #print(f"Loss: {loss.item():.4f}, Accuracy: {correct_severity/total_samples*100:.2f}%")
+            print(f"Batch {batch_idx + 1} - Loss: {loss.item():.4f}, Accuracy: {correct_severity/total_samples*100:.2f}%")
 
         print(f"Epoch {epoch+1}, Loss: {running_loss/len(dataloader):.4f}, Severity Acc: {correct_severity/total_samples*100:.2f}%\n")
 
@@ -175,26 +220,41 @@ def suggest_treatment(disease, severity):
     }
     return treatments[disease][severity]
 
-# Dự đoán và gợi ý điều trị
-def predict_and_suggest(image_path, disease_model, severity_model):
-    image = Image.open(image_path)
-    image = transform(image).unsqueeze(0).to(device)
+# Dự đoán và gợi ý điều trị (sửa)
+def predict_with_segmentation(image_path, disease_model, severity_model):
+    original_image = Image.open(image_path).convert("RGB")  # Ảnh gốc
+    segmented_image = segment_leaf(image_path)  # Tách lá trước
     
+    # Hiển thị ảnh gốc và ảnh sau khi xử lý
+    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+    ax[0].imshow(original_image)
+    ax[0].set_title("Ảnh gốc")
+    ax[0].axis("off")
+
+    ax[1].imshow(segmented_image)
+    ax[1].set_title("Ảnh sau khi xử lý")
+    ax[1].axis("off")
+
+    plt.show()
+
+    # Tiếp tục tiền xử lý ảnh để phân loại bệnh
+    transformed_image = transform(segmented_image).unsqueeze(0).to(device)
+
     disease_model.eval()
     severity_model.eval()
-    with torch.no_grad():  
-        disease_output = disease_model(image)
-        severity_output = severity_model(image)
-        
+    with torch.no_grad():
+        disease_output = disease_model(transformed_image)
+        severity_output = severity_model(transformed_image)
+
         _, predicted_disease = torch.max(disease_output, 1)
         _, predicted_severity = torch.max(severity_output, 1)
-        
+
         disease_name = disease_classes[predicted_disease.item()]
         severity_level = predicted_severity.item()
-        
+
         print(f"Dự đoán bệnh: {disease_name}")
         print(f"Mức độ nghiêm trọng: {severity_level}")
-        
+
         treatment = suggest_treatment(disease_name, severity_level)
         print(f"Hướng xử lý: {treatment}")
 
@@ -207,8 +267,8 @@ if __name__ == '__main__':
     optimizer_severity = optim.Adam(severity_model.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss()
     
-    train_disease_model(disease_model, train_dataloader, criterion, optimizer_disease, epochs=5)
-    train_severity_model(severity_model, train_dataloader, criterion, optimizer_severity, epochs=5)
+    train_disease_model(disease_model, train_dataloader, criterion, optimizer_disease, epochs=1)
+    train_severity_model(severity_model, train_dataloader, criterion, optimizer_severity, epochs=1)
     
-    test_image_path = r"C:\Users\ADMIN\Desktop\MSE\NCKH\DiaMOS\test\disease\pear_slug\467_aug_0_u2327.jpg"
-    predict_and_suggest(test_image_path, disease_model, severity_model)
+    test_image_path = r"C:\Users\ADMIN\Desktop\MSE\NCKH\DiaMOS\test\severity\4\2885_aug_0_u2249.jpg"
+    predict_with_segmentation(test_image_path, disease_model, severity_model) #Sửa
