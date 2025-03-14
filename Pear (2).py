@@ -5,58 +5,45 @@ import time
 import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 from torch import nn, optim
-from torchvision.models.segmentation import deeplabv3_resnet50
 import numpy as np
 from torchvision import transforms
 from PIL import Image
+import cv2
 
 # Thiết lập thiết bị
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-# Load mô hình DeepLabV3 đã pretrain trên COCO
-segmentation_model = deeplabv3_resnet50(pretrained=True).eval().to(device) # Thêm
-
 disease_classes = ['curl', 'healthy', 'leaf_spot', 'pear_slug', 'test1', 'test2']
 severity_classes = ['0', '1', '2', '3', '4', 'test']
 
-def preprocess_for_segmentation(image): # Thêm
-    transform = transforms.Compose([
-        transforms.Resize((256, 256)),  # Resize ảnh về 256x256 để phù hợp với mô hình
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Chuẩn hóa theo COCO
-    ])
-    return transform(image).unsqueeze(0).to(device)  # Thêm batch dimension
-
-
-def segment_leaf(image_path): 
-    image = Image.open(image_path).convert("RGB")  
-    input_tensor = preprocess_for_segmentation(image)  
-
-    with torch.no_grad():
-        output = segmentation_model(input_tensor)
-        if isinstance(output, dict) and 'out' in output:
-            output = output['out'][0]
-        else:
-            print("⚠️ DeepLabV3 không trả về key 'out', kiểm tra lại mô hình!")
-            return image  
-
-    mask = output.argmax(0).byte().cpu().numpy()  
-    print("Unique values in mask:", np.unique(mask))  
-
-    leaf_class = 21 if 21 in np.unique(mask) else mask.max()  
-    mask = (mask == leaf_class).astype(np.uint8)  
-
-    # Resize mask về kích thước gốc của ảnh
-    mask_resized = Image.fromarray(mask * 255).resize(image.size, Image.NEAREST)
-    mask_resized = np.array(mask_resized) // 255  
-
-    # Áp dụng mask lên ảnh gốc
-    image_array = np.array(image)
-    segmented_image = image_array * mask_resized[:, :, None]  
-
+def segment_leaf(image_path):
+    # Load image
+    image = cv2.imread(image_path)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # Chuyển sang định dạng RGB
+    
+    # Create an initial mask with the same size as the image
+    mask = np.zeros(image.shape[:2], np.uint8)
+    
+    # Define a rectangle for GrabCut (có thể tùy chỉnh tọa độ)
+    # Ở đây tôi dùng một vùng mặc định, bạn có thể thay đổi hoặc thêm tương tác chuột
+    height, width = image.shape[:2]
+    rect = (50, 50, width-100, height-100)  # Ví dụ: cách lề 50px
+    
+    # Initialize background and foreground models
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+    
+    # Apply GrabCut
+    cv2.grabCut(image, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
+    
+    # Modify the mask: 0 and 2 are background, 1 and 3 are foreground
+    mask2 = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
+    
+    # Apply the mask to the original image
+    segmented_image = image * mask2[:, :, np.newaxis]
+    
+    # Convert back to PIL Image for compatibility with the rest of the code
     return Image.fromarray(segmented_image)
-
 
 # Dataset tùy chỉnh
 class CustomDataset(Dataset):
@@ -146,8 +133,6 @@ def train_disease_model(model, dataloader, criterion, optimizer, epochs=1):
         total_samples = 0
         
         for batch_idx, (images, disease_labels, severity_labels) in enumerate(dataloader):
-            #print(f"Batch {batch_idx + 1}: {len(images)} samples")  
-
             valid_mask = severity_labels == 5
             images, disease_labels = images[valid_mask], disease_labels[valid_mask]
 
@@ -168,7 +153,6 @@ def train_disease_model(model, dataloader, criterion, optimizer, epochs=1):
             correct_disease += (preds == disease_labels).sum().item()
             total_samples += disease_labels.size(0)
 
-            # In thông tin batch
             print(f"Batch {batch_idx + 1} - Loss: {loss.item():.4f}, Accuracy: {correct_disease/total_samples*100:.2f}%")
 
         print(f"Epoch {epoch+1}, Loss: {running_loss/len(dataloader):.4f}, Disease Acc: {correct_disease/total_samples*100:.2f}%\n")
@@ -184,8 +168,6 @@ def train_severity_model(model, dataloader, criterion, optimizer, epochs=1):
         total_samples = 0
         
         for batch_idx, (images, disease_labels, severity_labels) in enumerate(dataloader):
-            #print(f"Batch {batch_idx + 1}: {len(images)} samples")
-
             valid_mask = disease_labels == 5
             images, severity_labels = images[valid_mask], severity_labels[valid_mask]
 
@@ -210,7 +192,6 @@ def train_severity_model(model, dataloader, criterion, optimizer, epochs=1):
 
         print(f"Epoch {epoch+1}, Loss: {running_loss/len(dataloader):.4f}, Severity Acc: {correct_severity/total_samples*100:.2f}%\n")
 
-
 def suggest_treatment(disease, severity):
     treatments = {
         'curl': ["Không cần điều trị", "Tưới nước đúng cách", "Sử dụng phân bón", "Phun thuốc bảo vệ thực vật", "Cắt tỉa phần bị hỏng"],
@@ -220,10 +201,10 @@ def suggest_treatment(disease, severity):
     }
     return treatments[disease][severity]
 
-# Dự đoán và gợi ý điều trị (sửa)
+# Dự đoán và gợi ý điều trị
 def predict_with_segmentation(image_path, disease_model, severity_model):
     original_image = Image.open(image_path).convert("RGB")  # Ảnh gốc
-    segmented_image = segment_leaf(image_path)  # Tách lá trước
+    segmented_image = segment_leaf(image_path)  # Tách lá bằng GrabCut
     
     # Hiển thị ảnh gốc và ảnh sau khi xử lý
     fig, ax = plt.subplots(1, 2, figsize=(10, 5))
@@ -270,5 +251,5 @@ if __name__ == '__main__':
     train_disease_model(disease_model, train_dataloader, criterion, optimizer_disease, epochs=1)
     train_severity_model(severity_model, train_dataloader, criterion, optimizer_severity, epochs=1)
     
-    test_image_path = r"C:\Users\ADMIN\Desktop\MSE\NCKH\DiaMOS\test\severity\4\2885_aug_0_u2249.jpg"
-    predict_with_segmentation(test_image_path, disease_model, severity_model) #Sửa
+    test_image_path = r"C:\Users\ADMIN\Desktop\MSE\NCKH\DiaMOS\test\disease\curl\aug_curl_0_3276.jpg"
+    predict_with_segmentation(test_image_path, disease_model, severity_model)
